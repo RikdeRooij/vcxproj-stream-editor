@@ -50,7 +50,7 @@ Usage example 1 (input only):
                 print("Project GUID is ", params["content"])
 
     vcxproj.check_file("myproject.vcxproj", print_project_guid)
-    
+
     Prints: "Project GUID is {96F21549-A7BF-4695-A1B1-B43625B91A14}"
 
 Usage example 2 (input and output):
@@ -72,7 +72,7 @@ Usage example 2 (input and output):
             target.send((action, params))
 
     vcxproj.filter_file("myproject.vcxproj", remove_warning_level, "myproject.stripped.vcxproj")
-    
+
     myproject.stripped.vcxproj will have the following content:
         <?xml version="1.0" encoding="utf-8"?>
         <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -98,7 +98,7 @@ Notes:
 
 from collections import OrderedDict
 from xml.parsers import expat
-from xml.sax.saxutils import quoteattr
+from shlex import shlex
 import codecs
 import io
 import sys
@@ -209,6 +209,9 @@ def send_element(target, name, attrs, content=None):
     target.send(("end_elem", dict(name=name)))
 
 
+# ---- api ------------
+
+
 def check_file(input_filename, genchecker):
     """Read and check (or otherwise process) a project file.
 
@@ -269,8 +272,15 @@ def process_file(filename, pipeline):
         print("Error:", expat.errors.messages[err.code], file=sys.stderr)
 
 
+# ---- output ------------
+
+
 def xml_indent(n):
     return "  " * n
+
+
+def xml_decl_meta(name, attrs):
+    return "<?{}{}?>".format(name, xml_attrs(attrs))
 
 
 def xml_tag_open_elem(name, attrs):
@@ -285,8 +295,24 @@ def xml_tag_close_elem(name):
     return "</{}>".format(name)
 
 
+def xml_quoteattr(data):
+    """Escape and quote an attribute value.
+
+    similar to the xml.sax.saxutils.quoteattr function,
+    except that < and > characters are kept unchanged.
+    """
+    data = data.replace("&", "&amp;")
+    data = data.replace('\n', '&#10;').replace('\r', '&#13;')
+    data = data.replace('\t', '&#9;')
+    if '"' in data:
+        if not "'" in data:
+            return "'%s'" % data
+        data = data.replace('"', "&quot;")
+    return '"%s"' % data
+
+
 def xml_attrs(attrs):
-    return "".join(" {}={}".format(name, quoteattr(value))
+    return "".join(" {}={}".format(name, xml_quoteattr(value))
                    for name, value in attrs.items())
 
 
@@ -318,6 +344,8 @@ def item_logger(target, prefix="", writer=print):
             writer(prefix + "  " * indent, "end[{}]".format(params["name"]))
         elif action == "chars":
             writer(prefix + "  " * indent, "chars:", repr(params["content"]))
+        elif action == "comment":
+            writer(prefix + "  " * indent, "comment:", repr(params["content"]))
         elif action == "noop":
             writer(prefix + "  " * indent, "noop")
         else:
@@ -325,10 +353,13 @@ def item_logger(target, prefix="", writer=print):
         target.send((action, params))
 
 
+# ---- writing ------------
+
+
 @coroutine
 def line_writer(writer, newline="\r\n"):
     """Sink coroutine; writes strings as lines to writer.
-    
+
     writer: writable file object
     input = string
 
@@ -351,7 +382,12 @@ def to_strings(target):
     target.send('<?xml version="1.0" encoding="utf-8"?>')
     while True:
         indent, action, params = yield
-        if action == "start_elem_line":
+        if action == "xml_model":
+            target.send(xml_indent(indent) +
+                        xml_decl_meta(**params))
+        if action == "comment_line":
+            target.send(xml_indent(indent) + params["content"].strip())
+        elif action == "start_elem_line":
             target.send(xml_indent(indent) +
                         xml_tag_open_elem(**params))
         elif action == "empty_elem_line":
@@ -400,6 +436,11 @@ def to_lines(target):
     """
     action, params = yield
     while True:
+        if action == "xml_model":
+            target.send(("xml_model", params))
+            action, params = yield
+            continue
+
         if action == "start_elem":
             action, params = (yield from
                               to_lines_post_start_elem(target, **params))
@@ -407,6 +448,11 @@ def to_lines(target):
 
         if action == "end_elem":
             target.send(("end_elem_line", params))
+            action, params = yield
+            continue
+
+        if action == "comment":
+            target.send(("comment_line", params))
             action, params = yield
             continue
 
@@ -427,9 +473,60 @@ def to_lines_post_start_elem(target, **start_elem):
         target.send(("empty_elem_line", start_elem))
         return (yield)
 
-    if action == "chars":
-        return (yield from to_lines_elem_chars(target, start_elem, params))
+    #if action == "chars":
+    #    return (yield from to_lines_elem_chars(target, start_elem, params))
 
+    if action == "chars" or action == "comment":
+        return (yield from to_lines_elem_chars_comment(target, start_elem, action, params))
+
+    target.send(("start_elem_line", start_elem))
+    return action, params
+
+
+@subcoroutine
+def to_lines_elem_chars_comment(target, start_elem, inaction, chars):
+    action, params = inaction, chars
+    content = ""
+
+    is_comment = False
+    if action == "comment":
+        is_comment = True
+        while action == "comment":
+            content += params["content"]
+            action, params = yield
+
+    if action == "chars":
+        is_comment = False
+        while action == "chars" or action == "comment":
+            if action == "comment":
+                content += "<!--"
+                while action == "comment":
+                    content += params["content"]
+                    action, params = yield
+                content += "-->"
+            else:
+                content += params["content"]
+                action, params = yield
+
+    if is_comment:
+        #if action != "end_elem":
+        if action == "start_elem":
+            target.send(("start_elem_line", start_elem))
+            target.send(("comment_line", dict(content=content)))
+            return action, params
+        #if action == "end_elem":
+        #    target.send(("comment_line", dict(content=content)))
+        #    content = ""
+
+    if action == "end_elem":
+        assert params["name"] == start_elem["name"]
+        target.send(("content_elem_line",
+                     dict(name=start_elem["name"],
+                          attrs=start_elem["attrs"],
+                          content=content)))
+        return (yield)
+
+    assert not content.strip()
     target.send(("start_elem_line", start_elem))
     return action, params
 
@@ -437,7 +534,7 @@ def to_lines_post_start_elem(target, **start_elem):
 @subcoroutine
 def to_lines_elem_chars(target, start_elem, chars):
     """Sub-coroutine for to_lines_post_start_elem().
-    
+
     Returns the next (peeked) (action, params).
     """
     action, params = "chars", chars
@@ -459,6 +556,9 @@ def to_lines_elem_chars(target, start_elem, chars):
     return action, params
 
 
+# ---- parsing ------------
+
+
 @coroutine
 def filter_chars(target):
     """Remove ignorable "chars" actions.
@@ -466,29 +566,69 @@ def filter_chars(target):
     Also consolidates "chars" with content into a single item.
     """
     # Whitespace can be ignored before a start_elem and after an end_elem.
-    last_action = None
     content = None  # Not None after a start_elem
     has_content = False  # True after a start_elem followed by a chars.
+    has_comment = False
+    closed_comment = False
     while True:
         action, params = yield
+        if action == "comment":
+            if content is None:
+                content = ""
+            if has_content and not content.strip():
+                has_content = False
+            if has_comment and not closed_comment:
+                content += "-->"
+            content += "<!--"
+            content += params["content"]
+            has_comment = True
+            closed_comment = False
+            continue
         if action == "chars":
             if content is not None:
+                if has_comment:
+                    if not has_content and not params["content"].strip():
+                        if not closed_comment:
+                            content += "-->"; closed_comment = True
+                        content += params["content"]
+                        continue
+                    if not closed_comment:
+                        content += "-->"; closed_comment = True
+                    has_comment = False
+                    closed_comment = False
                 content += params["content"]
                 has_content = True
             continue
         if action == "start_elem":
+            if content is not None:
+                if has_comment:
+                    if not closed_comment:
+                        content += "-->"; closed_comment = True
+                    target.send(("comment", dict(content=content)))
+                elif has_content:
+                    if content.strip():
+                        target.send(("chars", dict(content=content)))
             content = ""
             has_content = False
+            has_comment = False
+            closed_comment = False
         elif action == "end_elem":
-            if content is not None and has_content:
-                if "\n" in content and not content.strip():
-                    # We have an empty element list.
-                    # Preserve separate open-close tags.
-                    target.send(("noop", dict()))
-                else:
-                    target.send(("chars", dict(content=content)))
+            if content is not None:
+                if has_comment:
+                    if not closed_comment:
+                        content += "-->"; closed_comment = True
+                    target.send(("comment", dict(content=content)))
+                elif has_content:
+                    if "\n" in content and not content.strip():
+                        # We have an empty element list.
+                        # Preserve separate open-close tags.
+                        target.send(("noop", dict()))
+                    else:
+                        target.send(("chars", dict(content=content)))
             content = None
             has_content = False
+            has_comment = False
+            closed_comment = False
         target.send((action, params))
 
 
@@ -505,9 +645,12 @@ class ExpatParser:
         parser.ordered_attributes = True
         parser.specified_attributes = True
 
+        parser.XmlDeclHandler = self.on_xml_decl
+        parser.ProcessingInstructionHandler = self.on_processing_instruction
         parser.StartElementHandler = self.on_start_element
         parser.EndElementHandler = self.on_end_element
         parser.CharacterDataHandler = self.on_characters
+        parser.CommentHandler = self.on_comment
 
         return parser
 
@@ -517,6 +660,16 @@ class ExpatParser:
 
     def parse_file(self, binary_stream):
         self.parser.ParseFile(binary_stream)
+
+    def on_xml_decl(self, version, encoding, standalone = -1):
+        self.target.send(("xml_decl", dict(version=version, encoding=encoding, standalone=standalone)))
+
+    def on_processing_instruction(self, name, attrstr):
+        if name == "xml-model":
+            attrs = parse_kv_pairs(attrstr)
+            self.target.send(("xml_model", dict(name=name, attrs=attrs)))
+        else:
+            print("Unhandled processing instruction:", name, attrstr, file=sys.stderr)
 
     def on_start_element(self, name, attrs):
         # attrs is [name0, value0, name1, value1, ...]
@@ -530,6 +683,23 @@ class ExpatParser:
 
     def on_characters(self, content):
         self.target.send(("chars", dict(content=content)))
+
+    def on_comment(self, content):
+        self.target.send(("comment", dict(content=content)))
+
+
+# https://stackoverflow.com/a/38738997
+def parse_kv_pairs(text, item_sep=" \t\r\n", value_sep="="):
+    """Parse key-value pairs from a shell-like text."""
+    lexer = shlex(text, posix=True)
+    lexer.whitespace = item_sep
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    lexer.wordchars += value_sep
+    return dict(word.split(value_sep, maxsplit=1) for word in lexer)
+
+
+# ---- test ------------
 
 
 def test():

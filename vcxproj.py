@@ -272,88 +272,32 @@ def process_file(filename, pipeline):
         print("Error:", expat.errors.messages[err.code], file=sys.stderr)
 
 
-# ---- output ------------
+# ---- writing ------------
 
 
-def xml_indent(n):
-    return "  " * n
+def xml_indent(n): return "  " * n
 
+def xml_decl_meta(name, attrs): return "<?{}{}?>".format(name, xml_attrs(attrs))
 
-def xml_decl_meta(name, attrs):
-    return "<?{}{}?>".format(name, xml_attrs(attrs))
+def xml_tag_open_elem(name, attrs): return "<{}{}>".format(name, xml_attrs(attrs))
 
+def xml_tag_empty_elem(name, attrs): return "<{}{} />".format(name, xml_attrs(attrs))
 
-def xml_tag_open_elem(name, attrs):
-    return "<{}{}>".format(name, xml_attrs(attrs))
-
-
-def xml_tag_empty_elem(name, attrs):
-    return "<{}{} />".format(name, xml_attrs(attrs))
-
-
-def xml_tag_close_elem(name):
-    return "</{}>".format(name)
-
+def xml_tag_close_elem(name): return "</{}>".format(name)
 
 def xml_quoteattr(data):
     """Escape and quote an attribute value.
-
-    similar to the xml.sax.saxutils.quoteattr function,
-    except that < and > characters are kept unchanged.
-    """
+    won't change < and > characters (unlike saxutils.quoteattr)"""
     data = data.replace("&", "&amp;")
     data = data.replace('\n', '&#10;').replace('\r', '&#13;')
     data = data.replace('\t', '&#9;')
-    if '"' in data:
-        if not "'" in data:
-            return "'%s'" % data
-        data = data.replace('"', "&quot;")
-    return '"%s"' % data
-
+    if not '"' in data: return '"%s"' % data
+    if not "'" in data: return "'%s'" % data
+    return '"%s"' % data.replace('"', "&quot;")
 
 def xml_attrs(attrs):
     return "".join(" {}={}".format(name, xml_quoteattr(value))
                    for name, value in attrs.items())
-
-
-@coroutine
-def logger(target, prefix="", writer=print):
-    """A pass-through coroutine that prints items.
-
-    For debugging various stages of a coroutine pipeline.
-    """
-    while True:
-        item = yield
-        writer(prefix, item)
-        target.send(item)
-
-
-@coroutine
-def item_logger(target, prefix="", writer=print):
-    """A pass-through logger for parsed items."""
-    indent = 0
-    while True:
-        action, params = yield
-        if action == "start_elem":
-            writer(prefix + "  " * indent, "start[{}]:".format(params["name"]),
-                   ", ".join("{}={}".format(key, repr(val))
-                             for key, val in params["attrs"].items()))
-            indent += 1
-        elif action == "end_elem":
-            indent -= 1
-            writer(prefix + "  " * indent, "end[{}]".format(params["name"]))
-        elif action == "chars":
-            writer(prefix + "  " * indent, "chars:", repr(params["content"]))
-        elif action == "comment":
-            writer(prefix + "  " * indent, "comment:", repr(params["content"]))
-        elif action == "noop":
-            writer(prefix + "  " * indent, "noop")
-        else:
-            assert False, "Unexpected action"
-        target.send((action, params))
-
-
-# ---- writing ------------
 
 
 @coroutine
@@ -566,7 +510,7 @@ def filter_chars(target):
     Also consolidates "chars" with content into a single item.
     """
     # Whitespace can be ignored before a start_elem and after an end_elem.
-    content = None  # Not None after a start_elem
+    content:str|None = None  # Not None after a start_elem
     has_content = False  # True after a start_elem followed by a chars.
     has_comment = False
     closed_comment = False
@@ -664,32 +608,36 @@ class ExpatParser:
     def on_xml_decl(self, version, encoding, standalone = -1):
         self.target.send(("xml_decl", dict(version=version, encoding=encoding, standalone=standalone)))
 
-    def on_processing_instruction(self, name, attrstr):
+    def on_processing_instruction(self, name: str, attrstr: str):
         if name == "xml-model":
             attrs = parse_kv_pairs(attrstr)
             self.target.send(("xml_model", dict(name=name, attrs=attrs)))
         else:
             print("Unhandled processing instruction:", name, attrstr, file=sys.stderr)
 
-    def on_start_element(self, name, attrs):
+    # def on_start_element(self, name: str, attrs: dict[str, str]):
+    #    attrs_dic:OrderedDict[str,str] = OrderedDict(attrs)
+    #    self.target.send(("start_elem", dict(name=name, attrs=attrs_dic)))
+
+    def on_start_element(self, name: str, attrs: list[str]):
         # attrs is [name0, value0, name1, value1, ...]
         iattrs = iter(attrs)
         attr_items = zip(iattrs, iattrs)
-        attrs = OrderedDict(attr_items)
-        self.target.send(("start_elem", dict(name=name, attrs=attrs)))
+        attrs_dic:OrderedDict[str,str] = OrderedDict(attr_items)
+        self.target.send(("start_elem", dict(name=name, attrs=attrs_dic)))
 
-    def on_end_element(self, name):
+    def on_end_element(self, name: str):
         self.target.send(("end_elem", dict(name=name)))
 
-    def on_characters(self, content):
+    def on_characters(self, content: str):
         self.target.send(("chars", dict(content=content)))
 
-    def on_comment(self, content):
+    def on_comment(self, content: str):
         self.target.send(("comment", dict(content=content)))
 
 
 # https://stackoverflow.com/a/38738997
-def parse_kv_pairs(text, item_sep=" \t\r\n", value_sep="="):
+def parse_kv_pairs(text: str, item_sep=" \t\r\n", value_sep="="):
     """Parse key-value pairs from a shell-like text."""
     lexer = shlex(text, posix=True)
     lexer.whitespace = item_sep
@@ -697,6 +645,46 @@ def parse_kv_pairs(text, item_sep=" \t\r\n", value_sep="="):
     lexer.commenters = ''
     lexer.wordchars += value_sep
     return dict(word.split(value_sep, maxsplit=1) for word in lexer)
+
+
+# ---- utils ------------
+
+
+@coroutine
+def logger(target, prefix="", writer=print):
+    """A pass-through coroutine that prints items.
+
+    For debugging various stages of a coroutine pipeline.
+    """
+    while True:
+        item = yield
+        writer(prefix, item)
+        target.send(item)
+
+
+@coroutine
+def item_logger(target, prefix="", writer=print):
+    """A pass-through logger for parsed items."""
+    indent = 0
+    while True:
+        action, params = yield
+        if action == "start_elem":
+            writer(prefix + "  " * indent, "start[{}]:".format(params["name"]),
+                   ", ".join("{}={}".format(key, repr(val))
+                             for key, val in params["attrs"].items()))
+            indent += 1
+        elif action == "end_elem":
+            indent -= 1
+            writer(prefix + "  " * indent, "end[{}]".format(params["name"]))
+        elif action == "chars":
+            writer(prefix + "  " * indent, "chars:", repr(params["content"]))
+        elif action == "comment":
+            writer(prefix + "  " * indent, "comment:", repr(params["content"]))
+        elif action == "noop":
+            writer(prefix + "  " * indent, "noop")
+        else:
+            assert False, "Unexpected action"
+        target.send((action, params))
 
 
 # ---- test ------------

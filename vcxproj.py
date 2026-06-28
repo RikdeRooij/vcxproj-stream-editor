@@ -97,6 +97,7 @@ Notes:
 
 
 from collections import OrderedDict
+from typing import Any, Callable
 from xml.parsers import expat
 from shlex import shlex
 import codecs
@@ -207,6 +208,65 @@ def send_element(target, name, attrs, content=None):
     if content is not None:
         target.send(("chars", dict(content=content)))
     target.send(("end_elem", dict(name=name)))
+
+
+@subcoroutine
+def element_subtree(target, action, params, root=None):
+    """Forward all items to target from current start-element
+    upto it's matching end-element (inclusive).
+
+    The depth relative to the start, and the value returned by target previously
+    (by the yield_list) for a parent of items following, are included in the send,
+    allowing to more easily build a tree data structure for example."""
+    assert action == "start_elem"
+    start_e = params["name"]
+    depth = 0
+    parent = target.send((action, params, depth, root))
+    first = parent
+    element_stack = list[tuple]()
+    while True:
+        action, params = yield depth, parent
+        if action == "start_elem":
+            element_stack.append((params["name"], parent))
+            depth += 1
+            parent = target.send((action, params, depth, parent))
+            continue
+        elif action == "end_elem":
+            if not element_stack: # end_e
+                assert start_e == params["name"]
+                parent = target.send((action, params, depth, root))
+                return action, params, first, parent
+            (e,pe) = element_stack.pop()
+            assert e == params["name"]; parent = pe
+            target.send((action, params, depth, parent))
+            depth -= 1
+        else:
+            target.send((action, params, depth + 1, parent))
+
+@coroutine
+def gen_element_subtree(factory:Callable[[str,dict,int,Any|None],Any], root=None):
+    """Makes coroutine for element_subtree() that forwards to given callable."""
+    def gen_child_parent(parent, func):
+        try:
+            while True:
+                *rest, parent = yield parent
+                parent = func(*rest, parent)
+        except StopIteration: yield parent
+        except GeneratorExit: pass
+    target = gen_child_parent(root, factory); parent = next(target)
+    action,params = yield
+    action,params, start_e,end_e = yield from element_subtree(target, action,params, parent)
+    target.close()
+    yield [start_e,end_e]
+
+def gen_element_subtree_dict_lists():
+    """element_subtree() usage example, returns a coroutine"""
+    def add_node(action,params,depth,parent:dict|None):
+        node_item = dict(action=action, params=params, depth=depth)
+        if parent:
+            parent.setdefault("children", list()).append(node_item)
+        return node_item
+    return gen_element_subtree(add_node)
 
 
 # ---- api ------------
